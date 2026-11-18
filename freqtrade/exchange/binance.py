@@ -45,6 +45,8 @@ class Binance(Exchange):
         "fetch_orders_limit_minutes": None,
         "l2_limit_range": [5, 10, 20, 50, 100, 500, 1000],
         "ws_orderbook_depth": 100,
+        # Binance closes the connection (1008) on bursts of subscribe messages.
+        "ws_ohlcv_subscribe_batch_size": 50,
         "ws_enabled": {"ohlcv": True, "orderbook": True},
         "has_delisting": True,
         # Demo trading

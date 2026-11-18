@@ -62,6 +62,9 @@ class FtHas(TypedDict, total=False):
     # Depth the websocket orderbook is subscribed at, which is also the highest "limit"
     # it may answer.
     ws_orderbook_depth: int | None
+    # Max. number of pairs subscribed to with a single websocket message.
+    # None subscribes to every pair with its own message.
+    ws_ohlcv_subscribe_batch_size: int | None
     # fetch_orders
     fetch_orders_limit_minutes: int | None
     # Futures

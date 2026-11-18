@@ -883,3 +883,67 @@ async def test_exchangews_unwatch_while_stopping(mocker, caplog):
 
     assert ccxt_object.un_watch_ohlcv_for_symbols.call_count == 0
     assert log_has_re("Shutting down - skipping OHLCV unwatch for ETH/BTC, 1m", caplog)
+
+
+@pytest.mark.parametrize(
+    "batch_size,has_for_symbols,expected_batches",
+    [
+        (2, True, [[["ETH/BTC", "1m"], ["XRP/BTC", "1m"]], [["LTC/BTC", "5m"]]]),
+        (50, True, [[["ETH/BTC", "1m"], ["XRP/BTC", "1m"], ["LTC/BTC", "5m"]]]),
+        (None, True, []),
+        (2, False, []),
+    ],
+)
+async def test_exchangews_schedule_ohlcv_batched_subscribe(
+    mocker, batch_size, has_for_symbols, expected_batches
+):
+    ccxt_object = MagicMock()
+    ccxt_object.has = {"watchOHLCVForSymbols": has_for_symbols}
+    ccxt_object.watch_ohlcv_for_symbols = AsyncMock()
+    mocker.patch("freqtrade.exchange.exchange_ws.ExchangeWS._start_forever", MagicMock())
+    exchange_ws = ExchangeWS(MagicMock(), ccxt_object, ohlcv_subscribe_batch_size=batch_size)
+    watcher = mocker.patch.object(exchange_ws, "_continuously_async_watch_ohlcv", AsyncMock())
+    # Keep the pairs scheduled after the (mocked) watcher returns
+    mocker.patch.object(exchange_ws, "_ohlcv_stopped", MagicMock())
+
+    pairs = [
+        ("ETH/BTC", "1m", CandleType.SPOT),
+        ("XRP/BTC", "1m", CandleType.SPOT),
+        ("LTC/BTC", "5m", CandleType.SPOT),
+    ]
+    # A list keeps the order deterministic for the batch assertions
+    mocker.patch.object(exchange_ws, "_klines_watching", pairs)
+
+    await exchange_ws._schedule_while_true()
+    await asyncio.sleep(0.05)
+
+    assert [c.args[0] for c in ccxt_object.watch_ohlcv_for_symbols.call_args_list] == (
+        expected_batches
+    )
+    assert watcher.call_count == 3
+    assert exchange_ws._klines_scheduled == set(pairs)
+
+    # Already scheduled pairs are neither re-subscribed nor re-watched.
+    ccxt_object.watch_ohlcv_for_symbols.reset_mock()
+    await exchange_ws._schedule_while_true()
+    await asyncio.sleep(0.05)
+    assert ccxt_object.watch_ohlcv_for_symbols.call_count == 0
+    assert watcher.call_count == 3
+
+
+async def test_exchangews_batched_subscribe_failure(mocker, caplog):
+    caplog.set_level(logging.DEBUG)
+    ccxt_object = MagicMock()
+    ccxt_object.has = {"watchOHLCVForSymbols": True}
+    ccxt_object.watch_ohlcv_for_symbols = AsyncMock(side_effect=NotSupported("nope"))
+    mocker.patch("freqtrade.exchange.exchange_ws.ExchangeWS._start_forever", MagicMock())
+    exchange_ws = ExchangeWS(MagicMock(), ccxt_object, ohlcv_subscribe_batch_size=10)
+
+    exchange_ws._subscribe_ohlcv_batched(
+        [("ETH/BTC", "1m", CandleType.SPOT), ("XRP/BTC", "1m", CandleType.SPOT)]
+    )
+    assert len(exchange_ws._background_tasks) == 1
+    await asyncio.sleep(0.05)
+
+    assert exchange_ws._background_tasks == set()
+    assert log_has_re("Batched OHLCV subscription failed: nope", caplog)

@@ -165,6 +165,7 @@ class Exchange(LoggingMixin):
         "l2_limit_upper": None,  # Upper limit for L2 limit
         "orderbook_max_age": 5,
         "ws_orderbook_depth": None,
+        "ws_ohlcv_subscribe_batch_size": None,
         "mark_ohlcv_price": "mark",
         "mark_ohlcv_timeframe": "1h",
         "funding_fee_timeframe": "1h",
@@ -316,7 +317,10 @@ class Exchange(LoggingMixin):
         ):
             self._ws_async = self._init_ccxt(exchange_conf, False, ccxt_async_config)
             self._exchange_ws = ExchangeWS(
-                self._config, self._ws_async, self._ft_has["ws_orderbook_depth"]
+                self._config,
+                self._ws_async,
+                self._ft_has["ws_orderbook_depth"],
+                self._ft_has["ws_ohlcv_subscribe_batch_size"],
             )
 
         logger.info(f'Using Exchange "{self.name}"')

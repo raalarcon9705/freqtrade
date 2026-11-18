@@ -25,11 +25,16 @@ class ExchangeWS:
     ob_snapshot_timeout = 1.0
 
     def __init__(
-        self, config: Config, ccxt_object: ccxt.Exchange, orderbook_depth: int | None = None
+        self,
+        config: Config,
+        ccxt_object: ccxt.Exchange,
+        orderbook_depth: int | None = None,
+        ohlcv_subscribe_batch_size: int | None = None,
     ) -> None:
         self.config = config
         self._ccxt_object = ccxt_object
         self._orderbook_depth = orderbook_depth
+        self._ohlcv_subscribe_batch_size = ohlcv_subscribe_batch_size
         self._background_tasks: set[asyncio.Task] = set()
         self._state_lock = RLock()
         self._loop_ready = Event()
@@ -195,12 +200,19 @@ class ExchangeWS:
         with self._state_lock:
             pairs_to_check = list(self._klines_watching)
 
+        new_pairs: list[PairWithTimeframe] = []
         for p in pairs_to_check:
             # Check if they're already scheduled
             with self._state_lock:
                 if p in self._klines_scheduled:
                     continue
                 self._klines_scheduled.add(p)
+            new_pairs.append(p)
+
+        # Must run before the watchers are created, so they reuse the batched subscriptions.
+        self._subscribe_ohlcv_batched(new_pairs)
+
+        for p in new_pairs:
             pair, timeframe, candle_type = p
             task = asyncio.create_task(
                 self._continuously_async_watch_ohlcv(pair, timeframe, candle_type)
@@ -229,6 +241,39 @@ class ExchangeWS:
             with self._state_lock:
                 self._background_tasks.add(ob_task)
             ob_task.add_done_callback(partial(self._orderbook_stopped, pair=ob_pair))
+
+    def _subscribe_ohlcv_batched(self, pairs: list[PairWithTimeframe]) -> None:
+        """
+        Subscribe to multiple pairs with as few websocket messages as possible.
+        Without this, every watch_ohlcv() call sends its own subscribe message.
+        Some exchanges (e.g. binance) close the connection (code 1008) when too many
+        messages arrive in a short time, which happens when many pairs are scheduled at once.
+        The per-pair watchers reuse the existing subscriptions, so they don't send any message.
+        """
+        batch_size = self._ohlcv_subscribe_batch_size
+        if not batch_size or len(pairs) < 2 or not self.exchange_has("watchOHLCVForSymbols"):
+            return
+        by_candle_type: dict[CandleType, list[list[str]]] = {}
+        for pair, timeframe, candle_type in pairs:
+            by_candle_type.setdefault(candle_type, []).append([pair, timeframe])
+
+        for symbols_and_timeframes in by_candle_type.values():
+            for i in range(0, len(symbols_and_timeframes), batch_size):
+                task = asyncio.create_task(
+                    self._ccxt_object.watch_ohlcv_for_symbols(
+                        symbols_and_timeframes[i : i + batch_size]
+                    )
+                )
+                with self._state_lock:
+                    self._background_tasks.add(task)
+                task.add_done_callback(self._ohlcv_batch_subscribed)
+
+    def _ohlcv_batch_subscribed(self, task: asyncio.Task) -> None:
+        with self._state_lock:
+            self._background_tasks.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            # The per-pair watchers handle (and log) connection errors themselves.
+            logger.debug(f"Batched OHLCV subscription failed: {exc}")
 
     def _orderbook_stopped(self, task: asyncio.Task, pair: str) -> None:
         with self._state_lock:
