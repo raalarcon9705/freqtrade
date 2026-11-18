@@ -947,3 +947,43 @@ async def test_exchangews_batched_subscribe_failure(mocker, caplog):
 
     assert exchange_ws._background_tasks == set()
     assert log_has_re("Batched OHLCV subscription failed: nope", caplog)
+
+
+async def test_exchangews_schedule_ohlcv_debounced(mocker):
+    """With batching, pairs scheduled in one cycle are collected by a single schedule run."""
+    ccxt_object = MagicMock()
+    mocker.patch("freqtrade.exchange.exchange_ws.ExchangeWS._start_forever", MagicMock())
+    exchange_ws = ExchangeWS(MagicMock(), ccxt_object, ohlcv_subscribe_batch_size=200)
+    exchange_ws._loop = MagicMock()
+    run_threadsafe = mocker.patch("freqtrade.exchange.exchange_ws.asyncio.run_coroutine_threadsafe")
+    schedule = mocker.patch.object(exchange_ws, "_schedule_while_true", AsyncMock())
+    mocker.patch.object(exchange_ws, "ohlcv_schedule_delay", 0.01)
+
+    for pair in ("ETH/BTC", "XRP/BTC", "LTC/BTC"):
+        exchange_ws.schedule_ohlcv(pair, "5m", CandleType.SPOT)
+
+    assert run_threadsafe.call_count == 1
+    assert exchange_ws._ohlcv_schedule_pending is True
+    await run_threadsafe.call_args[0][0]
+    assert schedule.call_count == 1
+    assert exchange_ws._ohlcv_schedule_pending is False
+
+    # The next cycle triggers a new run
+    exchange_ws.schedule_ohlcv("ETH/BTC", "5m", CandleType.SPOT)
+    assert run_threadsafe.call_count == 2
+    run_threadsafe.call_args[0][0].close()
+
+
+def test_exchangews_schedule_ohlcv_no_batching(mocker):
+    mocker.patch("freqtrade.exchange.exchange_ws.ExchangeWS._start_forever", MagicMock())
+    exchange_ws = ExchangeWS(MagicMock(), MagicMock())
+    exchange_ws._loop = MagicMock()
+    run_threadsafe = mocker.patch("freqtrade.exchange.exchange_ws.asyncio.run_coroutine_threadsafe")
+
+    for pair in ("ETH/BTC", "XRP/BTC"):
+        exchange_ws.schedule_ohlcv(pair, "5m", CandleType.SPOT)
+
+    # Unchanged behavior: one run per scheduled pair
+    assert run_threadsafe.call_count == 2
+    for c in run_threadsafe.call_args_list:
+        c[0][0].close()

@@ -23,6 +23,8 @@ class ExchangeWS:
     ob_timeout = 60  # 1m
     # Timeout for the get orderbook snapshot round trip to the websocket thread.
     ob_snapshot_timeout = 1.0
+    # Time to collect the pairs of one refresh cycle before subscribing to them in batches.
+    ohlcv_schedule_delay = 1.0
 
     def __init__(
         self,
@@ -35,6 +37,7 @@ class ExchangeWS:
         self._ccxt_object = ccxt_object
         self._orderbook_depth = orderbook_depth
         self._ohlcv_subscribe_batch_size = ohlcv_subscribe_batch_size
+        self._ohlcv_schedule_pending = False
         self._background_tasks: set[asyncio.Task] = set()
         self._state_lock = RLock()
         self._loop_ready = Event()
@@ -251,7 +254,7 @@ class ExchangeWS:
         The per-pair watchers reuse the existing subscriptions, so they don't send any message.
         """
         batch_size = self._ohlcv_subscribe_batch_size
-        if not batch_size or len(pairs) < 2 or not self.exchange_has("watchOHLCVForSymbols"):
+        if not batch_size or not pairs or not self.exchange_has("watchOHLCVForSymbols"):
             return
         by_candle_type: dict[CandleType, list[list[str]]] = {}
         for pair, timeframe, candle_type in pairs:
@@ -438,9 +441,28 @@ class ExchangeWS:
         with self._state_lock:
             self._klines_watching.add((pair, timeframe, candle_type))
             self._klines_last_request[(pair, timeframe, candle_type)] = dt_ts()
-        # asyncio.run_coroutine_threadsafe(self.schedule_schedule(), loop=self._loop)
-        asyncio.run_coroutine_threadsafe(self._schedule_while_true(), loop=self._loop)
+            # With batching, one pending run collects all pairs scheduled in this cycle.
+            submit = not (self._ohlcv_subscribe_batch_size and self._ohlcv_schedule_pending)
+            if self._ohlcv_subscribe_batch_size:
+                self._ohlcv_schedule_pending = True
+        if submit:
+            coro = (
+                self._schedule_ohlcv_debounced()
+                if self._ohlcv_subscribe_batch_size
+                else self._schedule_while_true()
+            )
+            asyncio.run_coroutine_threadsafe(coro, loop=self._loop)
         self.cleanup_expired()
+
+    async def _schedule_ohlcv_debounced(self) -> None:
+        """
+        Wait shortly so all pairs of the current refresh cycle get scheduled
+        (schedule_ohlcv() is called once per pair), then subscribe to them in batches.
+        """
+        await asyncio.sleep(self.ohlcv_schedule_delay)
+        with self._state_lock:
+            self._ohlcv_schedule_pending = False
+        await self._schedule_while_true()
 
     async def get_ohlcv(
         self,
